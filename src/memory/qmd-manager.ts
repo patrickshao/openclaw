@@ -24,9 +24,38 @@ import {
 import { requireNodeSqlite } from "./sqlite.js";
 
 type SqliteDatabase = import("node:sqlite").DatabaseSync;
-import type { ResolvedMemoryBackendConfig, ResolvedQmdConfig } from "./backend-config.js";
-import { QmdDaemon } from "./qmd-daemon.js";
+import type {
+  ResolvedMemoryBackendConfig,
+  ResolvedQmdConfig,
+  ResolvedQmdDaemonConfig,
+} from "./backend-config.js";
 import { parseQmdQueryJson, type QmdQueryResult } from "./qmd-query-parser.js";
+
+const QMD_HTTP_PORT = 8181;
+const QMD_HTTP_URL = `http://localhost:${QMD_HTTP_PORT}/mcp`;
+const QMD_PID_FILE = path.join(os.homedir(), ".cache", "qmd", "mcp.pid");
+const MAX_BACKOFF_MS = 30_000;
+const STABILITY_RESET_MS = 60_000;
+const HEALTH_POLL_INTERVAL_MS = 200;
+const HEALTH_POLL_MAX_MS = 10_000;
+
+type DaemonState = "stopped" | "starting" | "ready" | "error";
+
+type JsonRpcResponse = {
+  jsonrpc?: string;
+  id?: string | number | null;
+  result?: unknown;
+  error?: { code?: number; message?: string; data?: unknown };
+};
+
+export interface QmdDaemonQueryResult {
+  docid?: string;
+  file?: string;
+  title?: string;
+  score?: number;
+  snippet?: string;
+  context?: string | null;
+}
 
 const log = createSubsystemLogger("memory");
 
@@ -91,7 +120,15 @@ export class QmdMemoryManager implements MemorySearchManager {
   >();
   private readonly maxQmdOutputChars = MAX_QMD_OUTPUT_CHARS;
   private readonly sessionExporter: SessionExporterConfig | null;
-  private daemon: QmdDaemon | null = null;
+  private daemonEnabled: boolean = false;
+  private daemonConfig: ResolvedQmdDaemonConfig | null = null;
+  private daemonState: DaemonState = "stopped";
+  private daemonNextId = 1;
+  private daemonLastQueryAt = 0;
+  private daemonIdleTimer: NodeJS.Timeout | null = null;
+  private daemonBackoffMs = 1_000;
+  private daemonLastStartAt = 0;
+  private daemonStartPromise: Promise<void> | null = null;
   private updateTimer: NodeJS.Timeout | null = null;
   private pendingUpdate: Promise<void> | null = null;
   private queuedForcedUpdate: Promise<void> | null = null;
@@ -138,13 +175,8 @@ export class QmdMemoryManager implements MemorySearchManager {
         }
       : null;
     if (this.qmd.daemon.enabled) {
-      this.daemon = new QmdDaemon({
-        command: this.qmd.command,
-        env: this.env,
-        cwd: this.workspaceDir,
-        pidFilePath: path.join(this.qmdDir, "daemon.pid"),
-        daemonConfig: this.qmd.daemon,
-      });
+      this.daemonEnabled = true;
+      this.daemonConfig = this.qmd.daemon;
     }
     if (this.sessionExporter) {
       this.qmd.collections = [
@@ -165,7 +197,9 @@ export class QmdMemoryManager implements MemorySearchManager {
       return;
     }
 
-    await this.daemon?.cleanupOrphan();
+    if (this.daemonEnabled) {
+      await this.daemonCleanupOrphan();
+    }
     await fs.mkdir(this.xdgConfigHome, { recursive: true });
     await fs.mkdir(this.xdgCacheHome, { recursive: true });
     await fs.mkdir(path.dirname(this.indexPath), { recursive: true });
@@ -509,7 +543,9 @@ export class QmdMemoryManager implements MemorySearchManager {
     this.queuedForcedRuns = 0;
     await this.pendingUpdate?.catch(() => undefined);
     await this.queuedForcedUpdate?.catch(() => undefined);
-    await this.daemon?.stop();
+    if (this.daemonEnabled) {
+      await this.daemonStop();
+    }
     if (this.db) {
       this.db.close();
       this.db = null;
@@ -1166,7 +1202,7 @@ export class QmdMemoryManager implements MemorySearchManager {
     limit: number,
     collections: string[] = [],
   ): Promise<MemorySearchResult[] | null> {
-    if (!this.daemon) {
+    if (!this.daemonEnabled || !this.daemonConfig) {
       return null;
     }
 
@@ -1174,25 +1210,25 @@ export class QmdMemoryManager implements MemorySearchManager {
     // MCP tool accepts a single collection string; pass only when exactly one collection
     const collection = collections.length === 1 ? collections[0] : undefined;
     try {
-      if (this.daemon.isReady()) {
+      if (this.daemonState === "ready") {
         // Warm path
-        const raw = await this.daemon.query(query, {
+        const raw = await this.daemonQuery(query, {
           tool,
           limit,
           collection,
-          timeoutMs: this.qmd.daemon.warmTimeoutMs,
+          timeoutMs: this.daemonConfig.warmTimeoutMs,
         });
         return this.formatDaemonResults(raw, limit);
       }
 
       // Cold start path — daemon enabled but not running
-      await this.daemon.waitForBackoff();
-      await this.daemon.start();
-      const raw = await this.daemon.query(query, {
+      await this.daemonWaitForBackoff();
+      await this.daemonStart();
+      const raw = await this.daemonQuery(query, {
         tool,
         limit,
         collection,
-        timeoutMs: this.qmd.daemon.coldStartTimeoutMs,
+        timeoutMs: this.daemonConfig.coldStartTimeoutMs,
       });
       return this.formatDaemonResults(raw, limit);
     } catch (err) {
@@ -1201,10 +1237,11 @@ export class QmdMemoryManager implements MemorySearchManager {
       if (tool === "query" && errMsg.includes("context size")) {
         log.warn("qmd daemon query hit context size limit, retrying with vsearch");
         try {
-          const timeoutMs = this.daemon.isReady()
-            ? this.qmd.daemon.warmTimeoutMs
-            : this.qmd.daemon.coldStartTimeoutMs;
-          const raw = await this.daemon.query(query, {
+          const timeoutMs =
+            this.daemonState === "ready"
+              ? this.daemonConfig.warmTimeoutMs
+              : this.daemonConfig.coldStartTimeoutMs;
+          const raw = await this.daemonQuery(query, {
             tool: "qmd_vector_search",
             limit,
             collection,
@@ -1282,6 +1319,289 @@ export class QmdMemoryManager implements MemorySearchManager {
       return ["query", query, "--json", "-n", String(limit)];
     }
     return [command, query, "--json", "-n", String(limit)];
+  }
+
+  // --- Inline daemon methods ---
+
+  private async daemonCleanupOrphan(): Promise<void> {
+    try {
+      const pidStr = await fs.readFile(QMD_PID_FILE, "utf-8").catch(() => null);
+      if (!pidStr) {
+        return;
+      }
+      const pid = parseInt(pidStr.trim(), 10);
+      if (!Number.isFinite(pid) || pid <= 0) {
+        await fs.rm(QMD_PID_FILE, { force: true });
+        return;
+      }
+      try {
+        process.kill(pid, 0); // Check if alive
+        log.warn(`killing orphaned qmd HTTP daemon (pid ${pid})`);
+        await this.daemonRunCommand(["mcp", "stop"], 5_000);
+      } catch {
+        // Process doesn't exist — stale PID file
+        await fs.rm(QMD_PID_FILE, { force: true });
+      }
+    } catch (err) {
+      log.debug(`orphan cleanup failed: ${String(err)}`);
+    }
+  }
+
+  private async daemonStart(): Promise<void> {
+    if (this.daemonState === "ready") {
+      return;
+    }
+    if (this.daemonStartPromise) {
+      return this.daemonStartPromise;
+    }
+    this.daemonStartPromise = this.daemonDoStart().finally(() => {
+      this.daemonStartPromise = null;
+    });
+    return this.daemonStartPromise;
+  }
+
+  private async daemonDoStart(): Promise<void> {
+    if (!this.daemonConfig) {
+      return;
+    }
+    this.daemonState = "starting";
+    try {
+      this.daemonLastStartAt = Date.now();
+
+      // Launch the HTTP daemon (detaches itself)
+      await this.daemonRunCommand(
+        ["mcp", "--http", "--daemon"],
+        this.daemonConfig.coldStartTimeoutMs,
+      );
+
+      // Poll until the daemon is accepting HTTP requests
+      await this.daemonPollUntilReady();
+
+      this.daemonState = "ready";
+      this.daemonResetBackoff();
+      this.daemonResetIdleTimer();
+      log.info("qmd HTTP daemon started (ready)");
+    } catch (err) {
+      this.daemonState = "error";
+      log.debug(`qmd HTTP daemon start failed: ${String(err)}`);
+      // Try to stop any partially started daemon
+      await this.daemonRunCommand(["mcp", "stop"], 5_000).catch(() => undefined);
+      throw err;
+    }
+  }
+
+  private async daemonPollUntilReady(): Promise<void> {
+    const deadline = Date.now() + HEALTH_POLL_MAX_MS;
+    while (Date.now() < deadline) {
+      try {
+        const resp = await fetch(QMD_HTTP_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: this.daemonNextId++,
+            method: "initialize",
+            params: {
+              protocolVersion: "2024-11-05",
+              capabilities: {},
+              clientInfo: { name: "openclaw-qmd", version: "1.0.0" },
+            },
+          }),
+          signal: AbortSignal.timeout(2_000),
+        });
+        if (resp.ok) {
+          return;
+        }
+      } catch {
+        // Not ready yet
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, HEALTH_POLL_INTERVAL_MS));
+    }
+    throw new Error("qmd HTTP daemon failed to become ready within timeout");
+  }
+
+  private async daemonStop(): Promise<void> {
+    this.daemonClearIdleTimer();
+    if (this.daemonState === "stopped") {
+      return;
+    }
+    this.daemonState = "stopped";
+    try {
+      await this.daemonRunCommand(["mcp", "stop"], 5_000);
+    } catch (err) {
+      log.debug(`qmd mcp stop failed: ${String(err)}`);
+    }
+    log.info("qmd HTTP daemon stopped");
+  }
+
+  private async daemonQuery(
+    text: string,
+    opts: { tool: string; limit: number; collection?: string; timeoutMs: number },
+  ): Promise<QmdDaemonQueryResult[]> {
+    if (this.daemonState !== "ready") {
+      throw new Error("qmd daemon not ready");
+    }
+
+    this.daemonLastQueryAt = Date.now();
+    this.daemonResetIdleTimer();
+
+    const id = this.daemonNextId++;
+    const payload = {
+      jsonrpc: "2.0",
+      id,
+      method: "tools/call",
+      params: {
+        name: opts.tool,
+        arguments: {
+          query: text,
+          limit: opts.limit,
+          ...(opts.collection ? { collection: opts.collection } : {}),
+        },
+      },
+    };
+
+    let resp: Response;
+    try {
+      resp = await fetch(QMD_HTTP_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(opts.timeoutMs),
+      });
+    } catch (err) {
+      // Fetch failed — daemon may have crashed. Mark as error for restart.
+      this.daemonHandleCrash();
+      throw new Error(`qmd HTTP daemon request failed: ${String(err)}`, { cause: err });
+    }
+
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => "");
+      throw new Error(`qmd HTTP daemon returned ${resp.status}: ${body.slice(0, 500)}`);
+    }
+
+    const json = (await resp.json()) as JsonRpcResponse;
+
+    if (json.error) {
+      const msg = json.error.message ?? "qmd daemon rpc error";
+      throw new Error(msg);
+    }
+
+    const result = json.result as
+      | {
+          isError?: boolean;
+          content?: Array<{ type: string; text?: string }>;
+          structuredContent?: { results?: QmdDaemonQueryResult[] };
+        }
+      | undefined;
+
+    // Check for MCP-level errors (isError flag)
+    if (result?.isError) {
+      const errText =
+        Array.isArray(result?.content) && result.content[0]?.type === "text"
+          ? (result.content[0] as { text: string }).text
+          : "unknown daemon error";
+      throw new Error(`qmd daemon tool error: ${errText}`);
+    }
+
+    // Parse result — QMD returns structured data in structuredContent.results
+    if (result?.structuredContent?.results && Array.isArray(result.structuredContent.results)) {
+      return result.structuredContent.results;
+    }
+
+    // Fallback: try parsing text content as JSON
+    if (Array.isArray(result?.content) && result.content.length > 0) {
+      const first = result.content[0];
+      if (first?.type === "text" && typeof first.text === "string") {
+        try {
+          const parsed: unknown = JSON.parse(first.text);
+          if (Array.isArray(parsed)) {
+            return parsed as QmdDaemonQueryResult[];
+          }
+        } catch {
+          // Not JSON
+        }
+      }
+    }
+    return [];
+  }
+
+  private daemonHandleCrash(): void {
+    if (this.daemonState === "stopped") {
+      return;
+    }
+    this.daemonState = "error";
+    this.daemonClearIdleTimer();
+
+    const timeSinceStart = Date.now() - this.daemonLastStartAt;
+    if (timeSinceStart > STABILITY_RESET_MS) {
+      this.daemonResetBackoff();
+    } else {
+      this.daemonBackoffMs = Math.min(this.daemonBackoffMs * 2, MAX_BACKOFF_MS);
+    }
+  }
+
+  private daemonResetBackoff(): void {
+    this.daemonBackoffMs = 1_000;
+  }
+
+  private async daemonWaitForBackoff(): Promise<void> {
+    if (this.daemonBackoffMs > 1_000) {
+      log.info(`qmd daemon restart backoff: ${this.daemonBackoffMs}ms`);
+      await new Promise<void>((resolve) => setTimeout(resolve, this.daemonBackoffMs));
+    }
+  }
+
+  private daemonResetIdleTimer(): void {
+    this.daemonClearIdleTimer();
+    const timeout = this.daemonConfig?.idleTimeoutMs ?? 0;
+    if (timeout <= 0) {
+      return;
+    }
+    this.daemonIdleTimer = setTimeout(() => {
+      this.daemonOnIdle();
+    }, timeout);
+  }
+
+  private daemonClearIdleTimer(): void {
+    if (this.daemonIdleTimer) {
+      clearTimeout(this.daemonIdleTimer);
+      this.daemonIdleTimer = null;
+    }
+  }
+
+  private daemonOnIdle(): void {
+    log.info("qmd daemon idle timeout — shutting down");
+    void this.daemonStop();
+  }
+
+  private daemonRunCommand(args: string[], timeoutMs: number): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const child = spawn(this.qmd.command, args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: this.env,
+        cwd: this.workspaceDir,
+      });
+      let stderr = "";
+      child.stderr?.on("data", (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+      const timer = setTimeout(() => {
+        child.kill("SIGKILL");
+        reject(new Error(`qmd ${args.join(" ")} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      child.on("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(new Error(`qmd ${args.join(" ")} failed (code ${code}): ${stderr.slice(0, 500)}`));
+        }
+      });
+    });
   }
 }
 
