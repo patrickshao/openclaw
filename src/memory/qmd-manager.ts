@@ -1144,16 +1144,16 @@ export class QmdMemoryManager implements MemorySearchManager {
   }
 
   private resolveMcpTool(): string {
-    // MCP tool names match QMD CLI commands: search, vsearch, query
+    // HTTP daemon uses qmd_-prefixed tool names
     switch (this.qmd.searchMode) {
       case "search":
-        return "search";
+        return "qmd_search";
       case "vsearch":
-        return "vsearch";
+        return "qmd_vector_search";
       case "query":
-        return "query";
+        return "qmd_deep_search";
       default:
-        return "query";
+        return "qmd_deep_search";
     }
   }
 
@@ -1205,7 +1205,7 @@ export class QmdMemoryManager implements MemorySearchManager {
             ? this.qmd.daemon.warmTimeoutMs
             : this.qmd.daemon.coldStartTimeoutMs;
           const raw = await this.daemon.query(query, {
-            tool: "vsearch",
+            tool: "qmd_vector_search",
             limit,
             collection,
             timeoutMs,

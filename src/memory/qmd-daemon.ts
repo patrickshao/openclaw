@@ -1,22 +1,21 @@
-import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
-import { createInterface, type Interface } from "node:readline";
+import os from "node:os";
+import path from "node:path";
 import type { ResolvedQmdDaemonConfig } from "./backend-config.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 
 const log = createSubsystemLogger("memory");
 
-const SIGKILL_GRACE_MS = 5_000;
+const QMD_HTTP_PORT = 8181;
+const QMD_HTTP_URL = `http://localhost:${QMD_HTTP_PORT}/mcp`;
+const QMD_PID_FILE = path.join(os.homedir(), ".cache", "qmd", "mcp.pid");
 const MAX_BACKOFF_MS = 30_000;
 const STABILITY_RESET_MS = 60_000;
+const HEALTH_POLL_INTERVAL_MS = 200;
+const HEALTH_POLL_MAX_MS = 10_000;
 
 type DaemonState = "stopped" | "starting" | "ready" | "error";
-
-type PendingRequest = {
-  resolve: (value: unknown) => void;
-  reject: (error: Error) => void;
-  timer?: NodeJS.Timeout;
-};
 
 type JsonRpcResponse = {
   jsonrpc?: string;
@@ -43,9 +42,6 @@ export interface QmdDaemonQueryResult {
 }
 
 export class QmdDaemon {
-  private child: ChildProcessWithoutNullStreams | null = null;
-  private reader: Interface | null = null;
-  private readonly pending = new Map<string, PendingRequest>();
   private nextId = 1;
   private state: DaemonState = "stopped";
   private lastQueryAt = 0;
@@ -53,7 +49,6 @@ export class QmdDaemon {
   private backoffMs = 1_000;
   private lastStartAt = 0;
   private startPromise: Promise<void> | null = null;
-  private initialized = false;
 
   private readonly command: string;
   private readonly env: NodeJS.ProcessEnv;
@@ -73,36 +68,26 @@ export class QmdDaemon {
     return this.state === "ready";
   }
 
-  /** Clean up orphaned daemon from a previous run via PID file. */
+  /** Clean up orphaned daemon from a previous run. Uses `qmd mcp stop` which reads the PID file. */
   async cleanupOrphan(): Promise<void> {
     try {
-      const pidStr = await fs.readFile(this.pidFilePath, "utf-8").catch(() => null);
+      const pidStr = await fs.readFile(QMD_PID_FILE, "utf-8").catch(() => null);
       if (!pidStr) {
         return;
       }
       const pid = parseInt(pidStr.trim(), 10);
       if (!Number.isFinite(pid) || pid <= 0) {
-        await fs.rm(this.pidFilePath, { force: true });
+        await fs.rm(QMD_PID_FILE, { force: true });
         return;
       }
       try {
-        // Check if process exists
-        process.kill(pid, 0);
-        // Process exists — kill it
-        log.warn(`killing orphaned qmd daemon (pid ${pid})`);
-        process.kill(pid, "SIGTERM");
-        // Give it a moment then force-kill
-        await new Promise<void>((resolve) => setTimeout(resolve, 2_000));
-        try {
-          process.kill(pid, 0);
-          process.kill(pid, "SIGKILL");
-        } catch {
-          // Already dead
-        }
+        process.kill(pid, 0); // Check if alive
+        log.warn(`killing orphaned qmd HTTP daemon (pid ${pid})`);
+        await this.runCommand(["mcp", "stop"], 5_000);
       } catch {
         // Process doesn't exist — stale PID file
+        await fs.rm(QMD_PID_FILE, { force: true });
       }
-      await fs.rm(this.pidFilePath, { force: true });
     } catch (err) {
       log.debug(`orphan cleanup failed: ${String(err)}`);
     }
@@ -126,82 +111,53 @@ export class QmdDaemon {
     try {
       this.lastStartAt = Date.now();
 
-      const child = spawn(this.command, ["mcp"], {
-        stdio: ["pipe", "pipe", "pipe"],
-        env: this.env,
-        cwd: this.cwd,
-      });
-      this.child = child;
-      this.reader = createInterface({ input: child.stdout });
+      // Launch the HTTP daemon (detaches itself)
+      await this.runCommand(["mcp", "--http", "--daemon"], this.config.coldStartTimeoutMs);
 
-      this.reader.on("line", (line) => {
-        const trimmed = line.trim();
-        if (!trimmed) {
-          return;
-        }
-        this.handleLine(trimmed);
-      });
+      // Poll until the daemon is accepting HTTP requests
+      await this.pollUntilReady();
 
-      child.stderr?.on("data", (chunk: Buffer) => {
-        const lines = chunk.toString().split(/\r?\n/);
-        for (const line of lines) {
-          if (!line.trim()) {
-            continue;
-          }
-          log.debug(`qmd daemon stderr: ${line.trim()}`);
-        }
-      });
-
-      child.on("error", (err) => {
-        this.failAll(err instanceof Error ? err : new Error(String(err)));
-        if (this.state === "ready" || this.state === "starting") {
-          this.handleCrash();
-        }
-      });
-
-      child.on("close", (code, signal) => {
-        if (code !== 0 && code !== null) {
-          const reason = signal ? `signal ${signal}` : `code ${code}`;
-          this.failAll(new Error(`qmd daemon exited (${reason})`));
-        } else {
-          this.failAll(new Error("qmd daemon closed"));
-        }
-        if (this.state === "ready" || this.state === "starting") {
-          log.debug("qmd daemon process closed (will restart on next query)");
-          this.handleCrash();
-        }
-      });
-
-      // Write PID file
-      if (child.pid) {
-        await fs.writeFile(this.pidFilePath, String(child.pid), "utf-8");
-      }
-
-      // MCP initialize handshake
-      await this.rpcRequest(
-        "initialize",
-        {
-          protocolVersion: "2024-11-05",
-          capabilities: {},
-          clientInfo: { name: "openclaw-qmd", version: "1.0.0" },
-        },
-        { timeoutMs: this.config.coldStartTimeoutMs },
-      );
-
-      // Send initialized notification (no id = notification, no response expected)
-      this.rpcNotify("notifications/initialized");
-
-      this.initialized = true;
       this.state = "ready";
       this.resetBackoff();
       this.resetIdleTimer();
-      log.info("qmd daemon started (ready)");
+      log.info("qmd HTTP daemon started (ready)");
     } catch (err) {
       this.state = "error";
-      log.debug(`qmd daemon start failed: ${String(err)}`);
-      await this.cleanup();
+      log.debug(`qmd HTTP daemon start failed: ${String(err)}`);
+      // Try to stop any partially started daemon
+      await this.runCommand(["mcp", "stop"], 5_000).catch(() => undefined);
       throw err;
     }
+  }
+
+  private async pollUntilReady(): Promise<void> {
+    const deadline = Date.now() + HEALTH_POLL_MAX_MS;
+    while (Date.now() < deadline) {
+      try {
+        const resp = await fetch(QMD_HTTP_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: this.nextId++,
+            method: "initialize",
+            params: {
+              protocolVersion: "2024-11-05",
+              capabilities: {},
+              clientInfo: { name: "openclaw-qmd", version: "1.0.0" },
+            },
+          }),
+          signal: AbortSignal.timeout(2_000),
+        });
+        if (resp.ok) {
+          return;
+        }
+      } catch {
+        // Not ready yet
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, HEALTH_POLL_INTERVAL_MS));
+    }
+    throw new Error("qmd HTTP daemon failed to become ready within timeout");
   }
 
   async stop(): Promise<void> {
@@ -210,27 +166,31 @@ export class QmdDaemon {
       return;
     }
     this.state = "stopped";
-    await this.cleanup();
-    log.info("qmd daemon stopped");
+    try {
+      await this.runCommand(["mcp", "stop"], 5_000);
+    } catch (err) {
+      log.debug(`qmd mcp stop failed: ${String(err)}`);
+    }
+    log.info("qmd HTTP daemon stopped");
   }
 
   async query(
     text: string,
     opts: { tool: string; limit: number; collection?: string; timeoutMs: number },
   ): Promise<QmdDaemonQueryResult[]> {
-    if (!this.child || this.state !== "ready") {
+    if (this.state !== "ready") {
       throw new Error("qmd daemon not ready");
     }
 
     this.lastQueryAt = Date.now();
     this.resetIdleTimer();
 
-    const result = await this.rpcRequest<{
-      content?: Array<{ type: string; text?: string }>;
-      structuredContent?: { results?: QmdDaemonQueryResult[] };
-    }>(
-      "tools/call",
-      {
+    const id = this.nextId++;
+    const payload = {
+      jsonrpc: "2.0",
+      id,
+      method: "tools/call",
+      params: {
         name: opts.tool,
         arguments: {
           query: text,
@@ -238,11 +198,44 @@ export class QmdDaemon {
           ...(opts.collection ? { collection: opts.collection } : {}),
         },
       },
-      { timeoutMs: opts.timeoutMs },
-    );
+    };
+
+    let resp: Response;
+    try {
+      resp = await fetch(QMD_HTTP_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(opts.timeoutMs),
+      });
+    } catch (err) {
+      // Fetch failed — daemon may have crashed. Mark as error for restart.
+      this.handleCrash();
+      throw new Error(`qmd HTTP daemon request failed: ${String(err)}`, { cause: err });
+    }
+
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => "");
+      throw new Error(`qmd HTTP daemon returned ${resp.status}: ${body.slice(0, 500)}`);
+    }
+
+    const json = (await resp.json()) as JsonRpcResponse;
+
+    if (json.error) {
+      const msg = json.error.message ?? "qmd daemon rpc error";
+      throw new Error(msg);
+    }
+
+    const result = json.result as
+      | {
+          isError?: boolean;
+          content?: Array<{ type: string; text?: string }>;
+          structuredContent?: { results?: QmdDaemonQueryResult[] };
+        }
+      | undefined;
 
     // Check for MCP-level errors (isError flag)
-    if ((result as Record<string, unknown>)?.isError) {
+    if (result?.isError) {
       const errText =
         Array.isArray(result?.content) && result.content[0]?.type === "text"
           ? (result.content[0] as { text: string }).text
@@ -265,95 +258,11 @@ export class QmdDaemon {
             return parsed as QmdDaemonQueryResult[];
           }
         } catch {
-          // Not JSON — structuredContent is preferred anyway
+          // Not JSON
         }
       }
     }
     return [];
-  }
-
-  // --- JSON-RPC over stdio (same pattern as iMessage/Signal clients) ---
-
-  private async rpcRequest<T = unknown>(
-    method: string,
-    params?: Record<string, unknown>,
-    opts?: { timeoutMs?: number },
-  ): Promise<T> {
-    if (!this.child?.stdin) {
-      throw new Error("qmd daemon not running");
-    }
-    const id = this.nextId++;
-    const payload = { jsonrpc: "2.0", id, method, params: params ?? {} };
-    const line = `${JSON.stringify(payload)}\n`;
-    const timeoutMs = opts?.timeoutMs ?? 10_000;
-
-    const response = new Promise<T>((resolve, reject) => {
-      const key = String(id);
-      const timer =
-        timeoutMs > 0
-          ? setTimeout(() => {
-              this.pending.delete(key);
-              reject(new Error(`qmd daemon rpc timeout (${method})`));
-            }, timeoutMs)
-          : undefined;
-      this.pending.set(key, {
-        resolve: (value) => resolve(value as T),
-        reject,
-        timer,
-      });
-    });
-
-    this.child.stdin.write(line);
-    return await response;
-  }
-
-  private rpcNotify(method: string, params?: Record<string, unknown>): void {
-    if (!this.child?.stdin) {
-      return;
-    }
-    // Notifications have no id — server won't respond
-    const payload = { jsonrpc: "2.0", method, params: params ?? {} };
-    this.child.stdin.write(`${JSON.stringify(payload)}\n`);
-  }
-
-  private handleLine(line: string): void {
-    let parsed: JsonRpcResponse;
-    try {
-      parsed = JSON.parse(line) as JsonRpcResponse;
-    } catch {
-      log.debug(`qmd daemon: failed to parse: ${line.slice(0, 200)}`);
-      return;
-    }
-
-    if (parsed.id !== undefined && parsed.id !== null) {
-      const key = String(parsed.id);
-      const pending = this.pending.get(key);
-      if (!pending) {
-        return;
-      }
-      if (pending.timer) {
-        clearTimeout(pending.timer);
-      }
-      this.pending.delete(key);
-
-      if (parsed.error) {
-        const msg = parsed.error.message ?? "qmd daemon rpc error";
-        pending.reject(new Error(msg));
-      } else {
-        pending.resolve(parsed.result);
-      }
-    }
-    // Notifications from server (no id) are ignored for now
-  }
-
-  private failAll(err: Error): void {
-    for (const [_key, pending] of this.pending) {
-      if (pending.timer) {
-        clearTimeout(pending.timer);
-      }
-      pending.reject(err);
-    }
-    this.pending.clear();
   }
 
   // --- Lifecycle ---
@@ -363,8 +272,7 @@ export class QmdDaemon {
       return;
     }
     this.state = "error";
-    this.initialized = false;
-    this.cleanup().catch(() => undefined);
+    this.clearIdleTimer();
 
     const timeSinceStart = Date.now() - this.lastStartAt;
     if (timeSinceStart > STABILITY_RESET_MS) {
@@ -409,44 +317,34 @@ export class QmdDaemon {
     void this.stop();
   }
 
-  private async cleanup(): Promise<void> {
-    this.clearIdleTimer();
-    this.initialized = false;
-
-    this.reader?.close();
-    this.reader = null;
-
-    if (this.child) {
-      const child = this.child;
-      this.child = null;
-
-      child.stdin?.end();
-
-      try {
-        child.kill("SIGTERM");
-        await new Promise<void>((resolve) => {
-          const timer = setTimeout(() => {
-            try {
-              child.kill("SIGKILL");
-            } catch {
-              // ignore
-            }
-            resolve();
-          }, SIGKILL_GRACE_MS);
-          child.on("exit", () => {
-            clearTimeout(timer);
-            resolve();
-          });
-        });
-      } catch {
-        // ignore
-      }
-    }
-
-    // Reject any remaining pending requests
-    this.failAll(new Error("qmd daemon stopped"));
-
-    // Remove PID file
-    await fs.rm(this.pidFilePath, { force: true }).catch(() => undefined);
+  /** Run a qmd CLI command and wait for it to complete. */
+  private runCommand(args: string[], timeoutMs: number): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const child = spawn(this.command, args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: this.env,
+        cwd: this.cwd,
+      });
+      let stderr = "";
+      child.stderr?.on("data", (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+      const timer = setTimeout(() => {
+        child.kill("SIGKILL");
+        reject(new Error(`qmd ${args.join(" ")} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+      child.on("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(new Error(`qmd ${args.join(" ")} failed (code ${code}): ${stderr.slice(0, 500)}`));
+        }
+      });
+    });
   }
 }
