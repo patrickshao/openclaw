@@ -10,6 +10,13 @@ export type MemoryConfig = {
   qmd?: MemoryQmdConfig;
 };
 
+export type MemoryQmdDaemonConfig = {
+  enabled?: boolean;
+  idleTimeoutMs?: number;
+  coldStartTimeoutMs?: number;
+  warmTimeoutMs?: number;
+};
+
 export type MemoryQmdConfig = {
   command?: string;
   searchMode?: MemoryQmdSearchMode;
@@ -19,6 +26,7 @@ export type MemoryQmdConfig = {
   update?: MemoryQmdUpdateConfig;
   limits?: MemoryQmdLimitsConfig;
   scope?: SessionSendPolicyConfig;
+  daemon?: MemoryQmdDaemonConfig;
 };
 
 export type MemoryQmdIndexPath = {
