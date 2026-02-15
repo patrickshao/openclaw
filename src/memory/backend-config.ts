@@ -50,6 +50,13 @@ export type ResolvedQmdSessionConfig = {
   retentionDays?: number;
 };
 
+export type ResolvedQmdDaemonConfig = {
+  enabled: boolean;
+  idleTimeoutMs: number;
+  coldStartTimeoutMs: number;
+  warmTimeoutMs: number;
+};
+
 export type ResolvedQmdConfig = {
   command: string;
   searchMode: MemoryQmdSearchMode;
@@ -59,6 +66,7 @@ export type ResolvedQmdConfig = {
   limits: ResolvedQmdLimitsConfig;
   includeDefaultMemory: boolean;
   scope?: SessionSendPolicyConfig;
+  daemon: ResolvedQmdDaemonConfig;
 };
 
 const DEFAULT_BACKEND: MemoryBackend = "builtin";
@@ -253,6 +261,24 @@ function resolveDefaultCollections(
   }));
 }
 
+function resolveDaemonConfig(raw?: MemoryQmdConfig["daemon"]): ResolvedQmdDaemonConfig {
+  return {
+    enabled: raw?.enabled === true,
+    idleTimeoutMs:
+      typeof raw?.idleTimeoutMs === "number" && raw.idleTimeoutMs >= 0
+        ? raw.idleTimeoutMs
+        : 900_000,
+    coldStartTimeoutMs:
+      typeof raw?.coldStartTimeoutMs === "number" && raw.coldStartTimeoutMs >= 1000
+        ? raw.coldStartTimeoutMs
+        : 30_000,
+    warmTimeoutMs:
+      typeof raw?.warmTimeoutMs === "number" && raw.warmTimeoutMs >= 1000
+        ? raw.warmTimeoutMs
+        : 10_000,
+  };
+}
+
 export function resolveMemoryBackendConfig(params: {
   cfg: OpenClawConfig;
   agentId: string;
@@ -275,9 +301,13 @@ export function resolveMemoryBackendConfig(params: {
   const rawCommand = qmdCfg?.command?.trim() || "qmd";
   const parsedCommand = splitShellArgs(rawCommand);
   const command = parsedCommand?.[0] || rawCommand.split(/\s+/)[0] || "qmd";
+  const daemon = resolveDaemonConfig(qmdCfg?.daemon);
+  const searchMode = resolveSearchMode(qmdCfg?.searchMode);
+
   const resolved: ResolvedQmdConfig = {
     command,
-    searchMode: resolveSearchMode(qmdCfg?.searchMode),
+    searchMode,
+    daemon,
     collections,
     includeDefaultMemory,
     sessions: resolveSessionConfig(qmdCfg?.sessions, workspaceDir),

@@ -25,6 +25,7 @@ import { requireNodeSqlite } from "./sqlite.js";
 
 type SqliteDatabase = import("node:sqlite").DatabaseSync;
 import type { ResolvedMemoryBackendConfig, ResolvedQmdConfig } from "./backend-config.js";
+import { QmdDaemon } from "./qmd-daemon.js";
 import { parseQmdQueryJson, type QmdQueryResult } from "./qmd-query-parser.js";
 
 const log = createSubsystemLogger("memory");
@@ -90,6 +91,7 @@ export class QmdMemoryManager implements MemorySearchManager {
   >();
   private readonly maxQmdOutputChars = MAX_QMD_OUTPUT_CHARS;
   private readonly sessionExporter: SessionExporterConfig | null;
+  private daemon: QmdDaemon | null = null;
   private updateTimer: NodeJS.Timeout | null = null;
   private pendingUpdate: Promise<void> | null = null;
   private queuedForcedUpdate: Promise<void> | null = null;
@@ -135,6 +137,15 @@ export class QmdMemoryManager implements MemorySearchManager {
           collectionName: this.pickSessionCollectionName(),
         }
       : null;
+    if (this.qmd.daemon.enabled) {
+      this.daemon = new QmdDaemon({
+        command: this.qmd.command,
+        env: this.env,
+        cwd: this.workspaceDir,
+        pidFilePath: path.join(this.qmdDir, "daemon.pid"),
+        daemonConfig: this.qmd.daemon,
+      });
+    }
     if (this.sessionExporter) {
       this.qmd.collections = [
         ...this.qmd.collections,
@@ -154,6 +165,7 @@ export class QmdMemoryManager implements MemorySearchManager {
       return;
     }
 
+    await this.daemon?.cleanupOrphan();
     await fs.mkdir(this.xdgConfigHome, { recursive: true });
     await fs.mkdir(this.xdgCacheHome, { recursive: true });
     await fs.mkdir(path.dirname(this.indexPath), { recursive: true });
@@ -324,6 +336,13 @@ export class QmdMemoryManager implements MemorySearchManager {
       opts?.maxResults ?? this.qmd.limits.maxResults,
     );
     const collectionNames = this.listManagedCollectionNames();
+
+    // Try daemon path first
+    const daemonResults = await this.tryDaemonSearch(trimmed, limit, collectionNames);
+    if (daemonResults !== null) {
+      return daemonResults;
+    }
+
     if (collectionNames.length === 0) {
       log.warn("qmd query skipped: no managed collections configured");
       return [];
@@ -490,6 +509,7 @@ export class QmdMemoryManager implements MemorySearchManager {
     this.queuedForcedRuns = 0;
     await this.pendingUpdate?.catch(() => undefined);
     await this.queuedForcedUpdate?.catch(() => undefined);
+    await this.daemon?.stop();
     if (this.db) {
       this.db.close();
       this.db = null;
@@ -1121,6 +1141,128 @@ export class QmdMemoryManager implements MemorySearchManager {
       names.push(name);
     }
     return names;
+  }
+
+  private resolveMcpTool(): string {
+    // MCP tool names match QMD CLI commands: search, vsearch, query
+    switch (this.qmd.searchMode) {
+      case "search":
+        return "search";
+      case "vsearch":
+        return "vsearch";
+      case "query":
+        return "query";
+      default:
+        return "query";
+    }
+  }
+
+  /**
+   * Attempt to search via the daemon. Returns null if daemon is not enabled
+   * or fails (caller should fall back to spawn-per-query).
+   */
+  private async tryDaemonSearch(
+    query: string,
+    limit: number,
+    collections: string[] = [],
+  ): Promise<MemorySearchResult[] | null> {
+    if (!this.daemon) {
+      return null;
+    }
+
+    const tool = this.resolveMcpTool();
+    // MCP tool accepts a single collection string; pass only when exactly one collection
+    const collection = collections.length === 1 ? collections[0] : undefined;
+    try {
+      if (this.daemon.isReady()) {
+        // Warm path
+        const raw = await this.daemon.query(query, {
+          tool,
+          limit,
+          collection,
+          timeoutMs: this.qmd.daemon.warmTimeoutMs,
+        });
+        return this.formatDaemonResults(raw, limit);
+      }
+
+      // Cold start path — daemon enabled but not running
+      await this.daemon.waitForBackoff();
+      await this.daemon.start();
+      const raw = await this.daemon.query(query, {
+        tool,
+        limit,
+        collection,
+        timeoutMs: this.qmd.daemon.coldStartTimeoutMs,
+      });
+      return this.formatDaemonResults(raw, limit);
+    } catch (err) {
+      // If query mode fails due to context size, retry with vsearch (no reranker)
+      const errMsg = String(err);
+      if (tool === "query" && errMsg.includes("context size")) {
+        log.warn("qmd daemon query hit context size limit, retrying with vsearch");
+        try {
+          const timeoutMs = this.daemon.isReady()
+            ? this.qmd.daemon.warmTimeoutMs
+            : this.qmd.daemon.coldStartTimeoutMs;
+          const raw = await this.daemon.query(query, {
+            tool: "vsearch",
+            limit,
+            collection,
+            timeoutMs,
+          });
+          return this.formatDaemonResults(raw, limit);
+        } catch (retryErr) {
+          log.warn(`qmd daemon vsearch fallback also failed: ${String(retryErr)}`);
+        }
+      }
+      log.warn(`qmd daemon search failed, falling back to spawn-per-query: ${errMsg}`);
+      return null;
+    }
+  }
+
+  private async formatDaemonResults(
+    raw: Array<{ docid?: string; file?: string; score?: number; snippet?: string }>,
+    limit: number,
+  ): Promise<MemorySearchResult[]> {
+    const results: MemorySearchResult[] = [];
+    for (const entry of raw) {
+      // Prefer file path from structured response; fall back to docid hash lookup
+      let doc: { rel: string; abs: string; source: MemorySource } | null = null;
+      if (entry.file) {
+        doc = this.resolveDocFromFile(entry.file);
+      }
+      if (!doc) {
+        doc = await this.resolveDocLocation(entry.docid);
+      }
+      if (!doc) {
+        continue;
+      }
+      const snippet = entry.snippet?.slice(0, this.qmd.limits.maxSnippetChars) ?? "";
+      const lines = this.extractSnippetLines(snippet);
+      const score = typeof entry.score === "number" ? entry.score : 0;
+      results.push({
+        path: doc.rel,
+        startLine: lines.startLine,
+        endLine: lines.endLine,
+        score,
+        snippet,
+        source: doc.source,
+      });
+    }
+    return this.clampResultsByInjectedChars(results.slice(0, limit));
+  }
+
+  /** Resolve a relative file path from QMD structured response to a doc location. */
+  private resolveDocFromFile(
+    file: string,
+  ): { rel: string; abs: string; source: MemorySource } | null {
+    if (!file) {
+      return null;
+    }
+    // Determine source based on collection path prefix
+    const source: MemorySource = file.startsWith("sessions/") ? "sessions" : "memory";
+    const abs = path.resolve(this.qmdDir, file);
+    return { rel: file, abs, source };
   }
 
   private buildCollectionFilterArgs(collectionNames: string[]): string[] {

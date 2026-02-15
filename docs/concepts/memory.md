@@ -186,6 +186,16 @@ out to QMD for retrieval. Key points:
   `commandTimeoutMs`, `updateTimeoutMs`, `embedTimeoutMs`).
 - `limits`: clamp recall payload (`maxResults`, `maxSnippetChars`,
   `maxInjectedChars`, `timeoutMs`).
+- `daemon`: persistent QMD process that keeps ML models loaded in RAM between
+  searches, eliminating cold-start latency (~15s → ~5s for `query` mode):
+  - `enabled` (default `false`): start a long-lived `qmd mcp` process instead
+    of spawning per query.
+  - `idleTimeoutMs` (default `900000` / 15 min): kill daemon after this many ms
+    of no queries. Set `0` to keep alive indefinitely.
+  - `coldStartTimeoutMs` (default `30000`): timeout for the first query while
+    models load into RAM.
+  - `warmTimeoutMs` (default `10000`): timeout for subsequent queries with models
+    already loaded.
 - `scope`: same schema as [`session.sendPolicy`](/gateway/configuration#session).
   Default is DM-only (`deny` all, `allow` direct chats); loosen it to surface QMD
   hits in groups/channels.
@@ -212,12 +222,16 @@ out to QMD for retrieval. Key points:
 
 **Example**
 
-```json5
+````json5
 memory: {
   backend: "qmd",
   citations: "auto",
   qmd: {
     includeDefaultMemory: true,
+    searchMode: "query",
+    // Daemon mode: keep ML models loaded between searches (16 GB+ RAM recommended).
+    // Pairs best with "query" mode — warm queries drop from ~15s to ~6s.
+    daemon: { enabled: true },
     update: { interval: "5m", debounceMs: 15000 },
     limits: { maxResults: 6, timeoutMs: 4000 },
     scope: {
@@ -235,7 +249,6 @@ memory: {
     ]
   }
 }
-```
 
 **Citations & fallback**
 
@@ -258,7 +271,7 @@ agents: {
     }
   }
 }
-```
+````
 
 Notes:
 
