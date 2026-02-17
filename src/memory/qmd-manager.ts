@@ -1082,6 +1082,20 @@ export class QmdMemoryManager implements MemorySearchManager {
       }
       return resolved;
     }
+    // Backward-compatibility: allow bare "<collection>/<path>" inputs from older
+    // memory_search outputs and map them through the same collection guardrails.
+    const [collection, ...rest] = relPath.split("/");
+    if (collection && rest.length > 0) {
+      const root = this.collectionRoots.get(collection);
+      if (root) {
+        const joined = rest.join("/");
+        const resolved = path.resolve(root.path, joined);
+        if (!this.isWithinRoot(root.path, resolved)) {
+          throw new Error("qmd path escapes collection");
+        }
+        return resolved;
+      }
+    }
     const absPath = path.resolve(this.workspaceDir, relPath);
     if (!this.isWithinWorkspace(absPath)) {
       throw new Error("path escapes workspace");
@@ -1256,11 +1270,17 @@ export class QmdMemoryManager implements MemorySearchManager {
 
     const tool = this.resolveMcpTool();
     try {
-      const queryTimeoutMs = this.daemon.isReady()
+      let queryTimeoutMs = this.daemon.isReady()
         ? this.qmd.daemon.warmTimeoutMs
         : this.qmd.daemon.coldStartTimeoutMs;
 
       if (this.daemon.isReady()) {
+        const healthy = await this.daemon.ensureHealthy(Math.min(2_000, queryTimeoutMs));
+        if (!healthy) {
+          await this.daemon.waitForBackoff();
+          await this.daemon.start();
+          queryTimeoutMs = this.qmd.daemon.coldStartTimeoutMs;
+        }
         const raw =
           collections.length === 1
             ? await this.queryDaemonToolWithFallback({
@@ -1415,13 +1435,58 @@ export class QmdMemoryManager implements MemorySearchManager {
   private resolveDocFromFile(
     file: string,
   ): { rel: string; abs: string; source: MemorySource } | null {
-    if (!file) {
+    const trimmed = file.trim();
+    if (!trimmed) {
       return null;
     }
-    // Determine source based on collection path prefix
-    const source: MemorySource = file.startsWith("sessions/") ? "sessions" : "memory";
-    const abs = path.resolve(this.qmdDir, file);
-    return { rel: file, abs, source };
+    const normalized = trimmed.replace(/\\/g, "/").replace(/^\.\/+/, "");
+
+    // Preferred format from daemon tools is usually "<collection>/<path>".
+    const [collection, ...rest] = normalized.split("/");
+    if (collection && rest.length > 0) {
+      const root = this.collectionRoots.get(collection);
+      if (root) {
+        const collectionRelativePath = rest.join("/");
+        const absPath = path.normalize(path.resolve(root.path, collectionRelativePath));
+        if (this.isWithinRoot(root.path, absPath)) {
+          const relativeToWorkspace = path.relative(this.workspaceDir, absPath);
+          const relPath = this.buildSearchPath(
+            collection,
+            collectionRelativePath,
+            relativeToWorkspace,
+            absPath,
+          );
+          return { rel: relPath, abs: absPath, source: root.kind };
+        }
+      }
+    }
+
+    // Some qmd variants may return absolute file paths.
+    if (path.isAbsolute(trimmed)) {
+      const absPath = path.normalize(trimmed);
+      for (const [candidateCollection, root] of this.collectionRoots.entries()) {
+        if (!this.isWithinRoot(root.path, absPath)) {
+          continue;
+        }
+        const collectionRelativePath = path.relative(root.path, absPath).replace(/\\/g, "/");
+        if (!collectionRelativePath || collectionRelativePath.startsWith("..")) {
+          continue;
+        }
+        const relativeToWorkspace = path.relative(this.workspaceDir, absPath);
+        const relPath = this.buildSearchPath(
+          candidateCollection,
+          collectionRelativePath,
+          relativeToWorkspace,
+          absPath,
+        );
+        return { rel: relPath, abs: absPath, source: root.kind };
+      }
+    }
+
+    // Legacy fallback keeps prior behavior for unknown formats.
+    const source: MemorySource = normalized.startsWith("sessions/") ? "sessions" : "memory";
+    const abs = path.resolve(this.qmdDir, normalized);
+    return { rel: normalized, abs, source };
   }
 
   private buildCollectionFilterArgs(collectionNames: string[]): string[] {

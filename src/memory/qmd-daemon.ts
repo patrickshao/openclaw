@@ -52,8 +52,11 @@ export class QmdDaemon {
   private idleTimer: NodeJS.Timeout | null = null;
   private backoffMs = 1_000;
   private lastStartAt = 0;
+  private restartAttempt = 0;
+  private lastCrashReason = "startup";
   private startPromise: Promise<void> | null = null;
   private initialized = false;
+  private queryMutex: Promise<void> = Promise.resolve();
 
   private readonly command: string;
   private readonly env: NodeJS.ProcessEnv;
@@ -71,6 +74,24 @@ export class QmdDaemon {
 
   isReady(): boolean {
     return this.state === "ready";
+  }
+
+  /**
+   * Verify daemon responsiveness using a lightweight MCP request.
+   * If the daemon is wedged, tear it down so the caller can restart cleanly.
+   */
+  async ensureHealthy(timeoutMs = 2_000): Promise<boolean> {
+    if (!this.isReady()) {
+      return false;
+    }
+    try {
+      await this.rpcRequest("tools/list", undefined, { timeoutMs });
+      return true;
+    } catch (err) {
+      log.warn(`qmd daemon health check failed: ${String(err)}`);
+      this.handleCrash("health_check_failed");
+      return false;
+    }
   }
 
   /** Clean up orphaned daemon from a previous run via PID file. */
@@ -155,7 +176,7 @@ export class QmdDaemon {
       child.on("error", (err) => {
         this.failAll(err instanceof Error ? err : new Error(String(err)));
         if (this.state === "ready" || this.state === "starting") {
-          this.handleCrash();
+          this.handleCrash("child_error");
         }
       });
 
@@ -168,7 +189,13 @@ export class QmdDaemon {
         }
         if (this.state === "ready" || this.state === "starting") {
           log.debug("qmd daemon process closed (will restart on next query)");
-          this.handleCrash();
+          const closeReason =
+            code !== null && code !== undefined
+              ? `child_close_code_${code}`
+              : signal
+                ? `child_close_signal_${signal.toLowerCase()}`
+                : "child_close";
+          this.handleCrash(closeReason);
         }
       });
 
@@ -195,6 +222,8 @@ export class QmdDaemon {
       this.state = "ready";
       this.resetBackoff();
       this.resetIdleTimer();
+      this.restartAttempt = 0;
+      this.lastCrashReason = "none";
       log.info("qmd daemon started (ready)");
     } catch (err) {
       this.state = "error";
@@ -218,58 +247,74 @@ export class QmdDaemon {
     text: string,
     opts: { tool: string; limit: number; collection?: string; timeoutMs: number },
   ): Promise<QmdDaemonQueryResult[]> {
-    if (!this.child || this.state !== "ready") {
-      throw new Error("qmd daemon not ready");
-    }
+    return await this.withQueryLock(async () => {
+      if (!this.child || this.state !== "ready") {
+        throw new Error("qmd daemon not ready");
+      }
 
-    this.lastQueryAt = Date.now();
-    this.resetIdleTimer();
+      this.lastQueryAt = Date.now();
+      this.resetIdleTimer();
 
-    const result = await this.rpcRequest<{
-      content?: Array<{ type: string; text?: string }>;
-      structuredContent?: { results?: QmdDaemonQueryResult[] };
-    }>(
-      "tools/call",
-      {
-        name: opts.tool,
-        arguments: {
-          query: text,
-          limit: opts.limit,
-          ...(opts.collection ? { collection: opts.collection } : {}),
+      const result = await this.rpcRequest<{
+        content?: Array<{ type: string; text?: string }>;
+        structuredContent?: { results?: QmdDaemonQueryResult[] };
+      }>(
+        "tools/call",
+        {
+          name: opts.tool,
+          arguments: {
+            query: text,
+            limit: opts.limit,
+            ...(opts.collection ? { collection: opts.collection } : {}),
+          },
         },
-      },
-      { timeoutMs: opts.timeoutMs },
-    );
+        { timeoutMs: opts.timeoutMs },
+      );
 
-    // Check for MCP-level errors (isError flag)
-    if ((result as Record<string, unknown>)?.isError) {
-      const errText =
-        Array.isArray(result?.content) && result.content[0]?.type === "text"
-          ? (result.content[0] as { text: string }).text
-          : "unknown daemon error";
-      throw new Error(`qmd daemon tool error: ${errText}`);
-    }
+      // Check for MCP-level errors (isError flag)
+      if ((result as Record<string, unknown>)?.isError) {
+        const errText =
+          Array.isArray(result?.content) && result.content[0]?.type === "text"
+            ? (result.content[0] as { text: string }).text
+            : "unknown daemon error";
+        throw new Error(`qmd daemon tool error: ${errText}`);
+      }
 
-    // Parse result — QMD returns structured data in structuredContent.results
-    if (result?.structuredContent?.results && Array.isArray(result.structuredContent.results)) {
-      return result.structuredContent.results;
-    }
+      // Parse result — QMD returns structured data in structuredContent.results
+      if (result?.structuredContent?.results && Array.isArray(result.structuredContent.results)) {
+        return result.structuredContent.results;
+      }
 
-    // Fallback: try parsing text content as JSON
-    if (Array.isArray(result?.content) && result.content.length > 0) {
-      const first = result.content[0];
-      if (first?.type === "text" && typeof first.text === "string") {
-        try {
-          const parsed: unknown = JSON.parse(first.text);
-          if (Array.isArray(parsed)) {
-            return parsed as QmdDaemonQueryResult[];
+      // Fallback: try parsing text content as JSON
+      if (Array.isArray(result?.content) && result.content.length > 0) {
+        const first = result.content[0];
+        if (first?.type === "text" && typeof first.text === "string") {
+          try {
+            const parsed: unknown = JSON.parse(first.text);
+            if (Array.isArray(parsed)) {
+              return parsed as QmdDaemonQueryResult[];
+            }
+          } catch {
+            // Not JSON — structuredContent is preferred anyway
           }
-        } catch {
-          // Not JSON — structuredContent is preferred anyway
         }
       }
+      return [];
+    });
+  }
+
+  private async withQueryLock<T>(fn: () => Promise<T>): Promise<T> {
+    const previous = this.queryMutex;
+    let release: () => void = () => undefined;
+    this.queryMutex = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous.catch(() => undefined);
+    try {
+      return await fn();
+    } finally {
+      release();
     }
-    return [];
   }
 
   // --- JSON-RPC over stdio (same pattern as iMessage/Signal clients) ---
@@ -293,6 +338,15 @@ export class QmdDaemon {
         timeoutMs > 0
           ? setTimeout(() => {
               this.pending.delete(key);
+              if (
+                method === "tools/call" &&
+                (this.state === "ready" || this.state === "starting")
+              ) {
+                log.warn(
+                  `qmd daemon request timed out (${method}, ${timeoutMs}ms); resetting daemon`,
+                );
+                this.handleCrash(`rpc_timeout_${method.replace("/", "_")}`);
+              }
               reject(new Error(`qmd daemon rpc timeout (${method})`));
             }, timeoutMs)
           : undefined;
@@ -358,20 +412,27 @@ export class QmdDaemon {
 
   // --- Lifecycle ---
 
-  private handleCrash(): void {
+  private handleCrash(reason = "unknown"): void {
     if (this.state === "stopped") {
       return;
     }
     this.state = "error";
     this.initialized = false;
+    this.lastCrashReason = reason;
     this.cleanup().catch(() => undefined);
 
     const timeSinceStart = Date.now() - this.lastStartAt;
     if (timeSinceStart > STABILITY_RESET_MS) {
       this.resetBackoff();
+      this.restartAttempt = 1;
     } else {
       this.backoffMs = Math.min(this.backoffMs * 2, MAX_BACKOFF_MS);
+      this.restartAttempt += 1;
     }
+    const uptimeMs = Math.max(0, timeSinceStart);
+    log.info(
+      `qmd daemon restart scheduled reason=${reason} attempt=${this.restartAttempt} uptimeMs=${uptimeMs} backoffMs=${this.backoffMs}`,
+    );
   }
 
   private resetBackoff(): void {
@@ -381,7 +442,9 @@ export class QmdDaemon {
   /** Wait for backoff period if needed before restarting. */
   async waitForBackoff(): Promise<void> {
     if (this.backoffMs > 1_000) {
-      log.info(`qmd daemon restart backoff: ${this.backoffMs}ms`);
+      log.info(
+        `qmd daemon restart backoff: ${this.backoffMs}ms reason=${this.lastCrashReason} attempt=${this.restartAttempt}`,
+      );
       await new Promise<void>((resolve) => setTimeout(resolve, this.backoffMs));
     }
   }
