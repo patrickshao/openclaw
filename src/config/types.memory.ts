@@ -12,6 +12,7 @@ export type MemoryConfig = {
 
 export type MemoryQmdDaemonConfig = {
   enabled?: boolean;
+  port?: number;
   idleTimeoutMs?: number;
   coldStartTimeoutMs?: number;
   warmTimeoutMs?: number;

@@ -52,6 +52,7 @@ export type ResolvedQmdSessionConfig = {
 
 export type ResolvedQmdDaemonConfig = {
   enabled: boolean;
+  port: number;
   idleTimeoutMs: number;
   coldStartTimeoutMs: number;
   warmTimeoutMs: number;
@@ -81,6 +82,7 @@ const DEFAULT_QMD_EMBED_INTERVAL = "60m";
 const DEFAULT_QMD_COMMAND_TIMEOUT_MS = 30_000;
 const DEFAULT_QMD_UPDATE_TIMEOUT_MS = 120_000;
 const DEFAULT_QMD_EMBED_TIMEOUT_MS = 120_000;
+const DEFAULT_QMD_DAEMON_PORT = 18_790;
 const DEFAULT_QMD_LIMITS: ResolvedQmdLimitsConfig = {
   maxResults: 6,
   maxSnippetChars: 700,
@@ -270,6 +272,10 @@ function resolveDefaultCollections(
 function resolveDaemonConfig(raw?: MemoryQmdConfig["daemon"]): ResolvedQmdDaemonConfig {
   return {
     enabled: raw?.enabled === true,
+    port:
+      typeof raw?.port === "number" && raw.port >= 1 && raw.port <= 65_535
+        ? Math.floor(raw.port)
+        : DEFAULT_QMD_DAEMON_PORT,
     idleTimeoutMs:
       typeof raw?.idleTimeoutMs === "number" && raw.idleTimeoutMs >= 0
         ? raw.idleTimeoutMs

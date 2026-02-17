@@ -114,16 +114,16 @@ out to QMD for retrieval. Key points:
 **Prereqs**
 
 - Disabled by default. Opt in per-config (`memory.backend = "qmd"`).
-- Install the QMD CLI separately (`bun install -g https://github.com/tobi/qmd` or grab
-  a release) and make sure the `qmd` binary is on the gateway’s `PATH`.
+- Install the QMD CLI separately (`npm i -g @tobilu/qmd@1.0.6`) and make sure
+  the `qmd` binary is on the gateway’s `PATH`.
 - QMD needs an SQLite build that allows extensions (`brew install sqlite` on
   macOS).
-- QMD runs fully locally via Bun + `node-llama-cpp` and auto-downloads GGUF
-  models from HuggingFace on first use (no separate Ollama daemon required).
+- QMD runs fully locally and auto-downloads GGUF models from HuggingFace on
+  first use (no separate Ollama daemon required).
 - The gateway runs QMD in a self-contained XDG home under
   `~/.openclaw/agents/<agentId>/qmd/` by setting `XDG_CONFIG_HOME` and
   `XDG_CACHE_HOME`.
-- OS support: macOS and Linux work out of the box once Bun + SQLite are
+- OS support: macOS and Linux work out of the box once dependencies are
   installed. Windows is best supported via WSL2.
 
 **How the sidecar runs**
@@ -188,8 +188,10 @@ out to QMD for retrieval. Key points:
   `maxInjectedChars`, `timeoutMs`).
 - `daemon`: persistent QMD process that keeps ML models loaded in RAM between
   searches, eliminating cold-start latency (~15s → ~5s for `query` mode):
-  - `enabled` (default `false`): start a long-lived `qmd mcp` process instead
-    of spawning per query.
+  - `enabled` (default `false`): start and reuse a long-lived local QMD HTTP
+    daemon (`qmd mcp --http --daemon`) instead of spawning per query.
+  - `port` (default `18790`): local daemon port. OpenClaw connects to
+    `127.0.0.1:<port>/mcp`.
   - `idleTimeoutMs` (default `900000` / 15 min): kill daemon after this many ms
     of no queries. Set `0` to keep alive indefinitely.
   - `coldStartTimeoutMs` (default `30000`): timeout for the first query while
@@ -231,7 +233,7 @@ memory: {
     searchMode: "query",
     // Daemon mode: keep ML models loaded between searches (16 GB+ RAM recommended).
     // Pairs best with "query" mode — warm queries drop from ~15s to ~6s.
-    daemon: { enabled: true },
+    daemon: { enabled: true, port: 18790 },
     update: { interval: "5m", debounceMs: 15000 },
     limits: { maxResults: 6, timeoutMs: 4000 },
     scope: {

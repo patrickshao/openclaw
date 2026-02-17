@@ -147,7 +147,6 @@ export class QmdMemoryManager implements MemorySearchManager {
         command: this.qmd.command,
         env: this.env,
         cwd: this.workspaceDir,
-        pidFilePath: path.join(this.qmdDir, "daemon.pid"),
         daemonConfig: this.qmd.daemon,
       });
     }
